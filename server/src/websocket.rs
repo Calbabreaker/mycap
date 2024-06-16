@@ -7,10 +7,8 @@ use tokio::sync::RwLock;
 use warp::{filters::ws::WebSocket, Filter};
 
 use crate::{
-    main_server::ServerMessage,
     serial::write_serial,
     tracker::{TrackerData, TrackerInfo},
-    MainServer,
 };
 
 pub const WEBSOCKET_PORT: u16 = 8298;
@@ -32,18 +30,54 @@ enum WebsocketClientMessage {
     FactoryReset,
 }
 
-type WebsocketTx = Arc<RwLock<SplitSink<WebSocket, warp::ws::Message>>>;
+type WebsocketTx = SplitSink<WebSocket, warp::ws::Message>;
 
-async fn send_websocket_message(ws_tx: &WebsocketTx, message: WebsocketServerMessage) {
-    if let Ok(string) = serde_json::to_string(&message) {
-        let mut ws_tx = ws_tx.write().await;
-        ws_tx.send(warp::ws::Message::text(string)).await.ok();
+pub struct WebsocketServer {
+    websocket_channels: Vec<WebsocketTx>,
+}
+
+impl WebsocketServer {
+    fn add_channel(&mut self, channel: WebsocketTx) {
+        self.websocket_channels.push(channel)
+    }
+
+    /// Sends a websocket messsage to all clients connected to the websocket server
+    async fn send_message_to_clients(&mut self, message: WebsocketServerMessage) {
+        let mut to_remove = None;
+
+        for (i, channel) in self.websocket_channels.iter_mut().enumerate() {
+            // The channel got closed or something so remove it
+            if let Ok(string) = serde_json::to_string(&message) {
+                if channel.send(warp::ws::Message::text(string)).await.is_err() {
+                    to_remove = Some(i)
+                }
+            }
+        }
+
+        if let Some(to_remove) = to_remove {
+            self.websocket_channels.swap_remove(to_remove);
+        }
+    }
+
+    async fn send_tracker_info(&mut self, info: TrackerInfo) {
+        self.send_message_to_clients(WebsocketServerMessage::TrackerInfo { info })
+            .await;
+    }
+
+    async fn send_tracker_data(&mut self, index: usize, data: TrackerData) {
+        self.send_message_to_clients(WebsocketServerMessage::TrackerData { index, data })
+            .await;
     }
 }
-pub async fn start_server(main: Arc<RwLock<MainServer>>) -> anyhow::Result<()> {
+
+pub async fn start_warp_server(
+    websocket_server: Arc<RwLock<WebsocketServer>>,
+) -> anyhow::Result<()> {
     let websocket = warp::ws()
-        .and(warp::any().map(move || main.clone()))
-        .map(|ws: warp::ws::Ws, main| ws.on_upgrade(|ws| on_connect(ws, main)));
+        .and(warp::any().map(move || websocket_server.clone()))
+        .map(|ws: warp::ws::Ws, websocket_server| {
+            ws.on_upgrade(|ws| on_connect(ws, websocket_server))
+        });
 
     let address = SocketAddr::from((Ipv4Addr::LOCALHOST, WEBSOCKET_PORT));
     log::info!("Started websocket server on {address}");
@@ -51,13 +85,11 @@ pub async fn start_server(main: Arc<RwLock<MainServer>>) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn on_connect(ws: WebSocket, main: Arc<RwLock<MainServer>>) {
+async fn on_connect(ws: WebSocket, websocket_server: Arc<RwLock<WebsocketServer>>) {
     log::info!("Websocket client connected");
-    let (_ws_tx, mut ws_rx) = ws.split();
-    let ws_tx = Arc::new(RwLock::new(_ws_tx));
+    let (ws_tx, mut ws_rx) = ws.split();
 
-    let (server_tx, mut server_rx) = tokio::sync::mpsc::unbounded_channel();
-    main.write().await.message_channels.add(server_tx);
+    websocket_server.write().await.add_channel(ws_tx);
 
     for tracker in &main.read().await.trackers {
         send_websocket_message(
@@ -68,14 +100,6 @@ async fn on_connect(ws: WebSocket, main: Arc<RwLock<MainServer>>) {
         )
         .await;
     }
-
-    // Spawn seperate task for listening to server messages
-    let ws_tx_clone = ws_tx.clone();
-    let server_messages_task = tokio::spawn(async move {
-        while let Some(message) = server_rx.recv().await {
-            handle_server_message(message, &ws_tx_clone).await;
-        }
-    });
 
     while let Some(ws_result) = ws_rx.next().await {
         let msg = match ws_result {
@@ -88,7 +112,7 @@ async fn on_connect(ws: WebSocket, main: Arc<RwLock<MainServer>>) {
 
         if let Ok(string) = msg.to_str() {
             log::info!("Got from websocket: {string}");
-            if let Err(error) = handle_websocket_message(string) {
+            if let Err(error) = handle_client_message(string) {
                 log::error!("{error}");
                 send_websocket_message(
                     &ws_tx,
@@ -118,7 +142,7 @@ async fn handle_server_message(message: ServerMessage, ws_tx: &WebsocketTx) {
     }
 }
 
-fn handle_websocket_message(string: &str) -> anyhow::Result<()> {
+fn handle_client_message(string: &str) -> anyhow::Result<()> {
     let message = serde_json::from_str(string)?;
 
     match message {

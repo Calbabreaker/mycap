@@ -1,12 +1,11 @@
 use std::{
     collections::HashMap,
-    sync::Arc,
     time::{Duration, Instant},
 };
 
-use tokio::sync::{mpsc::UnboundedSender, RwLock};
+use tokio::sync::mpsc::UnboundedSender;
 
-use crate::tracker::*;
+use crate::{tracker::*, udp_server::UdpServer};
 
 #[derive(Clone)]
 pub enum ServerMessage {
@@ -101,14 +100,26 @@ impl MainServer {
     }
 }
 
+trait SubServer {
+    fn receive_data();
+    fn on_tracker_info();
+    fn on_tracker_data();
+}
+
 const TARGET_LOOP_DELTA: Duration = Duration::from_millis(1000 / 50);
 
-pub async fn start_main_server_loop(main: Arc<RwLock<MainServer>>) -> anyhow::Result<()> {
+pub async fn start_main_server() -> anyhow::Result<()> {
+    let mut main = MainServer::default();
     let mut last_loop_time = Instant::now();
+
+    let mut udp_server = UdpServer::new().await?;
+
     loop {
         let delta = last_loop_time.elapsed();
         last_loop_time = Instant::now();
-        main.write().await.tick(delta);
+
+        main.tick(delta);
+        udp_server.tick(&mut main);
 
         let post_delta = last_loop_time.elapsed();
         if let Some(sleep_duration) = TARGET_LOOP_DELTA.checked_sub(post_delta) {

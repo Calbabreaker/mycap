@@ -10,15 +10,15 @@ pub const PACKET_TRACKER_DATA: u8 = 0x03;
 
 pub enum UdpPacket<'a> {
     Handshake(UdpPacketHandshake),
-    TrackerData((UdpPacketTrackerData<'a>, usize)),
-    TrackerStatus((UdpPacketTrackerStatus, usize)),
+    TrackerData((UdpPacketTrackerData<'a>, &'a mut UdpDevice)),
+    TrackerStatus((UdpPacketTrackerStatus, &'a mut UdpDevice)),
     Heartbeat,
 }
 
 impl<'a> UdpPacket<'a> {
     pub fn parse(
         bytes: &'a mut std::slice::Iter<'a, u8>,
-        mut device: Option<&mut UdpDevice>,
+        mut device: Option<&'a mut UdpDevice>,
     ) -> Option<Self> {
         let packet_type = *bytes.next()?;
 
@@ -30,7 +30,7 @@ impl<'a> UdpPacket<'a> {
             u32_parse(bytes)?
         };
 
-        if let Some(device) = device.as_mut() {
+        if let Some(ref mut device) = device {
             if packet_number <= device.last_packet_number && packet_type != PACKET_HANDSHAKE {
                 log::warn!("Received out of order packet {packet_number}");
                 return None;
@@ -44,10 +44,10 @@ impl<'a> UdpPacket<'a> {
             PACKET_HEARTBEAT => Self::Heartbeat,
             PACKET_HANDSHAKE => Self::Handshake(UdpPacketHandshake::from_bytes(bytes)?),
             PACKET_TRACKER_DATA => {
-                Self::TrackerData((UdpPacketTrackerData::from_bytes(bytes)?, device?.index))
+                Self::TrackerData((UdpPacketTrackerData::from_bytes(bytes)?, device?))
             }
             PACKET_TRACKER_STATUS => {
-                Self::TrackerStatus((UdpPacketTrackerStatus::from_bytes(bytes)?, device?.index))
+                Self::TrackerStatus((UdpPacketTrackerStatus::from_bytes(bytes)?, device?))
             }
             _ => return None,
         })
